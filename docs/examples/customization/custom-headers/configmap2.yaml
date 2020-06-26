@@ -20,4 +20,4 @@ metadata:
   resourceVersion: "735856"
   selfLink: /api/v1/namespaces/ingress-nginx/configmaps/ingress-nginx-controller
   uid: b30af485-a94b-4af2-ab70-a94fa538a9ea
-# kubectl apply -f https://raw.githubusercontent.com/crispy-peppers/ingress-nginx/master/docs/examples/customization/custom-headers/configmap3.yaml
+# kubectl apply -f https://raw.githubusercontent.com/crispy-peppers/ingress-nginx/master/docs/examples/customization/custom-headers/configmap2.yaml
