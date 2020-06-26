@@ -1,0 +1,8 @@
+apiVersion: v1
+data:
+  X-Original-Uri: "true"
+kind: ConfigMap
+metadata:
+  name: ingress-nginx-controller
+  namespace: ingress-nginx
+# kubectl apply -f https://raw.githubusercontent.com/crispy-peppers/ingress-nginx/master/docs/examples/customization/custom-headers/configmap2.yaml
