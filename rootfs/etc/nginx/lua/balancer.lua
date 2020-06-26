@@ -16,7 +16,7 @@ local getmetatable = getmetatable
 local tostring = tostring
 local pairs = pairs
 local math = math
-
+local ngx = ngx
 
 -- measured in seconds
 -- for an Nginx worker to pick up the new list of upstream peers
@@ -94,8 +94,6 @@ end
 
 local function sync_backend(backend)
   if not backend.endpoints or #backend.endpoints == 0 then
-    ngx.log(ngx.INFO, "there is no endpoint for backend ", backend.name,
-            ". Removing...")
     balancers[backend.name] = nil
     return
   end
@@ -187,14 +185,22 @@ local function route_to_alternative_balancer(balancer)
   local header = ngx.var["http_" .. target_header]
   if header then
     if traffic_shaping_policy.headerValue
-       and #traffic_shaping_policy.headerValue > 0 then
+	   and #traffic_shaping_policy.headerValue > 0 then
       if traffic_shaping_policy.headerValue == header then
         return true
       end
-
+    elseif traffic_shaping_policy.headerPattern
+       and #traffic_shaping_policy.headerPattern > 0 then
+      local m, err = ngx.re.match(header, traffic_shaping_policy.headerPattern)
+      if m then
+        return true
+      elseif  err then
+          ngx.log(ngx.ERR, "error when matching canary-by-header-pattern: '",
+                  traffic_shaping_policy.headerPattern, "', error: ", err)
+          return false
+      end
     elseif header == "always" then
       return true
-
     elseif header == "never" then
       return false
     end
@@ -242,11 +248,18 @@ local function get_balancer()
 end
 
 function _M.init_worker()
-  sync_backends() -- when worker starts, sync backends without delay
-  local _, err = ngx.timer.every(BACKENDS_SYNC_INTERVAL, sync_backends)
-  if err then
-    ngx.log(ngx.ERR, "error when setting up timer.every for sync_backends: ",
-            tostring(err))
+  -- when worker starts, sync backends without delay
+  -- we call it in timer because for endpoints that require
+  -- DNS resolution it needs to use socket which is not avalable in
+  -- init_worker phase
+  local ok, err = ngx.timer.at(0, sync_backends)
+  if not ok then
+    ngx.log(ngx.ERR, "failed to create timer: ", err)
+  end
+
+  ok, err = ngx.timer.every(BACKENDS_SYNC_INTERVAL, sync_backends)
+  if not ok then
+    ngx.log(ngx.ERR, "error when setting up timer.every for sync_backends: ", err)
   end
 end
 
@@ -292,11 +305,11 @@ function _M.log()
   balancer:after_balance()
 end
 
-if _TEST then
-  _M.get_implementation = get_implementation
-  _M.sync_backend = sync_backend
-  _M.route_to_alternative_balancer = route_to_alternative_balancer
-  _M.get_balancer = get_balancer
-end
+setmetatable(_M, {__index = {
+  get_implementation = get_implementation,
+  sync_backend = sync_backend,
+  route_to_alternative_balancer = route_to_alternative_balancer,
+  get_balancer = get_balancer,
+}})
 
 return _M

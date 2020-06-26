@@ -17,6 +17,7 @@ limitations under the License.
 package store
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io/ioutil"
@@ -24,8 +25,6 @@ import (
 	"sort"
 	"sync"
 	"time"
-
-	"k8s.io/klog"
 
 	"github.com/eapache/channels"
 	corev1 "k8s.io/api/core/v1"
@@ -35,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
@@ -42,6 +42,7 @@ import (
 	clientcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/klog"
 
 	"k8s.io/ingress-nginx/internal/file"
 	"k8s.io/ingress-nginx/internal/ingress"
@@ -54,6 +55,7 @@ import (
 	"k8s.io/ingress-nginx/internal/ingress/errors"
 	"k8s.io/ingress-nginx/internal/ingress/resolver"
 	"k8s.io/ingress-nginx/internal/k8s"
+	"k8s.io/ingress-nginx/internal/nginx"
 )
 
 // IngressFilterFunc decides if an Ingress should be omitted or not
@@ -259,10 +261,24 @@ func New(
 
 	store.listers.IngressWithAnnotation.Store = cache.NewStore(cache.DeletionHandlingMetaNamespaceKeyFunc)
 
+	// As we currently do not filter out kubernetes objects we list, we can
+	// retrieve a huge amount of data from the API server.
+	// In a cluster using HELM < v3 configmaps are used to store binary data.
+	// If you happen to have a lot of HELM releases in the cluster it will make
+	// the memory consumption of nginx-ingress-controller explode.
+	// In order to avoid that we filter out labels OWNER=TILLER.
+	tweakListOptionsFunc := func(options *metav1.ListOptions) {
+		if len(options.LabelSelector) > 0 {
+			options.LabelSelector += ",OWNER!=TILLER"
+		} else {
+			options.LabelSelector = "OWNER!=TILLER"
+		}
+	}
+
 	// create informers factory, enable and assign required informers
 	infFactory := informers.NewSharedInformerFactoryWithOptions(client, resyncPeriod,
 		informers.WithNamespace(namespace),
-		informers.WithTweakListOptions(func(*metav1.ListOptions) {}))
+		informers.WithTweakListOptions(tweakListOptionsFunc))
 
 	if k8s.IsNetworkingIngressAvailable {
 		store.informers.Ingress = infFactory.Networking().V1beta1().Ingresses().Informer()
@@ -289,11 +305,11 @@ func New(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (k8sruntime.Object, error) {
 				options.LabelSelector = labelSelector.String()
-				return client.CoreV1().Pods(store.pod.Namespace).List(options)
+				return client.CoreV1().Pods(store.pod.Namespace).List(context.TODO(), options)
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 				options.LabelSelector = labelSelector.String()
-				return client.CoreV1().Pods(store.pod.Namespace).Watch(options)
+				return client.CoreV1().Pods(store.pod.Namespace).Watch(context.TODO(), options)
 			},
 		},
 		&corev1.Pod{},
@@ -530,66 +546,58 @@ func New(
 		return name == configmap || name == tcp || name == udp
 	}
 
-	cmEventHandler := cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			cm := obj.(*corev1.ConfigMap)
-			key := k8s.MetaNamespaceKey(cm)
-			// updates to configuration configmaps can trigger an update
-			if changeTriggerUpdate(key) {
-				recorder.Eventf(cm, corev1.EventTypeNormal, "CREATE", fmt.Sprintf("ConfigMap %v", key))
+	handleCfgMapEvent := func(key string, cfgMap *corev1.ConfigMap, eventName string) {
+		// updates to configuration configmaps can trigger an update
+		triggerUpdate := false
+		if changeTriggerUpdate(key) {
+			triggerUpdate = true
+			recorder.Eventf(cfgMap, corev1.EventTypeNormal, eventName, fmt.Sprintf("ConfigMap %v", key))
+			if key == configmap {
+				store.setConfig(cfgMap)
+			}
+		}
 
-				if key == configmap {
-					store.setConfig(cm)
-				}
+		ings := store.listers.IngressWithAnnotation.List()
+		for _, ingKey := range ings {
+			key := k8s.MetaNamespaceKey(ingKey)
+			ing, err := store.getIngress(key)
+			if err != nil {
+				klog.Errorf("could not find Ingress %v in local store: %v", key, err)
+				continue
 			}
 
+			if parser.AnnotationsReferencesConfigmap(ing) {
+				store.syncIngress(ing)
+				continue
+			}
+
+			if triggerUpdate {
+				store.syncIngress(ing)
+			}
+		}
+
+		if triggerUpdate {
 			updateCh.In() <- Event{
 				Type: ConfigurationEvent,
-				Obj:  obj,
+				Obj:  cfgMap,
 			}
+		}
+	}
+
+	cmEventHandler := cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			cfgMap := obj.(*corev1.ConfigMap)
+			key := k8s.MetaNamespaceKey(cfgMap)
+			handleCfgMapEvent(key, cfgMap, "CREATE")
 		},
 		UpdateFunc: func(old, cur interface{}) {
 			if reflect.DeepEqual(old, cur) {
 				return
 			}
 
-			// used to limit the number of events
-			triggerUpdate := false
-
-			cm := cur.(*corev1.ConfigMap)
-			key := k8s.MetaNamespaceKey(cm)
-			// updates to configuration configmaps can trigger an update
-			if changeTriggerUpdate(key) {
-				recorder.Eventf(cm, corev1.EventTypeNormal, "UPDATE", fmt.Sprintf("ConfigMap %v", key))
-				triggerUpdate = true
-			}
-
-			if key == configmap {
-				store.setConfig(cm)
-			}
-
-			ings := store.listers.IngressWithAnnotation.List()
-			for _, ingKey := range ings {
-				key := k8s.MetaNamespaceKey(ingKey)
-				ing, err := store.getIngress(key)
-				if err != nil {
-					klog.Errorf("could not find Ingress %v in local store: %v", key, err)
-					continue
-				}
-
-				if parser.AnnotationsReferencesConfigmap(ing) {
-					recorder.Eventf(cm, corev1.EventTypeNormal, "UPDATE", fmt.Sprintf("ConfigMap %v", key))
-					store.syncIngress(ing)
-					triggerUpdate = true
-				}
-			}
-
-			if triggerUpdate {
-				updateCh.In() <- Event{
-					Type: ConfigurationEvent,
-					Obj:  cur,
-				}
-			}
+			cfgMap := cur.(*corev1.ConfigMap)
+			key := k8s.MetaNamespaceKey(cfgMap)
+			handleCfgMapEvent(key, cfgMap, "UPDATE")
 		},
 	}
 
@@ -621,16 +629,32 @@ func New(
 		},
 	}
 
+	serviceHandler := cache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(old, cur interface{}) {
+			oldSvc := old.(*corev1.Service)
+			curSvc := cur.(*corev1.Service)
+
+			if reflect.DeepEqual(oldSvc, curSvc) {
+				return
+			}
+
+			updateCh.In() <- Event{
+				Type: UpdateEvent,
+				Obj:  cur,
+			}
+		},
+	}
+
 	store.informers.Ingress.AddEventHandler(ingEventHandler)
 	store.informers.Endpoint.AddEventHandler(epEventHandler)
 	store.informers.Secret.AddEventHandler(secrEventHandler)
 	store.informers.ConfigMap.AddEventHandler(cmEventHandler)
-	store.informers.Service.AddEventHandler(cache.ResourceEventHandlerFuncs{})
+	store.informers.Service.AddEventHandler(serviceHandler)
 	store.informers.Pod.AddEventHandler(podEventHandler)
 
 	// do not wait for informers to read the configmap configuration
 	ns, name, _ := k8s.ParseNameNS(configmap)
-	cm, err := client.CoreV1().ConfigMaps(ns).Get(name, metav1.GetOptions{})
+	cm, err := client.CoreV1().ConfigMaps(ns).Get(context.TODO(), name, metav1.GetOptions{})
 	if err != nil {
 		klog.Warningf("Unexpected error reading configuration configmap: %v", err)
 	}
@@ -644,6 +668,9 @@ func New(
 func isCatchAllIngress(spec networkingv1beta1.IngressSpec) bool {
 	return spec.Backend != nil && len(spec.Rules) == 0
 }
+
+// Default path type is Prefix to not break existing definitions
+var defaultPathType = networkingv1beta1.PathTypePrefix
 
 // syncIngress parses ingress annotations converting the value of the
 // annotation to a go struct
@@ -667,6 +694,8 @@ func (s *k8sStore) syncIngress(ing *networkingv1beta1.Ingress) {
 			}
 		}
 	}
+
+	k8s.SetDefaultNGINXPathType(copyIng)
 
 	err := s.listers.IngressWithAnnotation.Update(&ingress.Ingress{
 		Ingress:           *copyIng,
@@ -891,7 +920,16 @@ func (s *k8sStore) setConfig(cmap *corev1.ConfigMap) {
 	s.backendConfigMu.Lock()
 	defer s.backendConfigMu.Unlock()
 
+	if cmap == nil {
+		return
+	}
+
 	s.backendConfig = ngx_template.ReadConfig(cmap.Data)
+	if s.backendConfig.UseGeoIP2 && !nginx.GeoLite2DBExists() {
+		klog.Warning("The GeoIP2 feature is enabled but the databases are missing. Disabling.")
+		s.backendConfig.UseGeoIP2 = false
+	}
+
 	s.writeSSLSessionTicketKey(cmap, "/etc/nginx/tickets.key")
 }
 
@@ -922,8 +960,8 @@ func (s k8sStore) GetRunningControllerPodsCount() int {
 var runtimeScheme = k8sruntime.NewScheme()
 
 func init() {
-	extensionsv1beta1.AddToScheme(runtimeScheme)
-	networkingv1beta1.AddToScheme(runtimeScheme)
+	utilruntime.Must(extensionsv1beta1.AddToScheme(runtimeScheme))
+	utilruntime.Must(networkingv1beta1.AddToScheme(runtimeScheme))
 }
 
 func fromExtensions(old *extensionsv1beta1.Ingress) (*networkingv1beta1.Ingress, error) {
@@ -946,10 +984,12 @@ func toIngress(obj interface{}) (*networkingv1beta1.Ingress, bool) {
 			return nil, false
 		}
 
+		k8s.SetDefaultNGINXPathType(ing)
 		return ing, true
 	}
 
 	if ing, ok := obj.(*networkingv1beta1.Ingress); ok {
+		k8s.SetDefaultNGINXPathType(ing)
 		return ing, true
 	}
 

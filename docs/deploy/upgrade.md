@@ -24,16 +24,16 @@ spec:
     spec:
       containers:
         - name: nginx-ingress-controller
-          image: quay.io/kubernetes-ingress-controller/nginx-ingress-controller:0.9.0
+          image: quay.io/kubernetes-ingress-controller/nginx-ingress-controller:0.30.0
           args: ...
 ```
 
-simply change the `0.9.0` tag to the version you wish to upgrade to.
+simply change the `0.30.0` tag to the version you wish to upgrade to.
 The easiest way to do this is e.g. (do note you may need to change the name parameter according to your installation):
 
 ```
 kubectl set image deployment/nginx-ingress-controller \
-  nginx-ingress-controller=quay.io/kubernetes-ingress-controller/nginx-ingress-controller:0.18.0
+  nginx-ingress-controller=quay.io/kubernetes-ingress-controller/nginx-ingress-controller:0.33.0
 ```
 
 For interactive editing, use `kubectl edit deployment nginx-ingress-controller`.
@@ -44,5 +44,5 @@ If you installed ingress-nginx using the Helm command in the deployment docs so 
 you should be able to upgrade using
 
 ```shell
-helm upgrade --reuse-values ngx-ingress stable/nginx-ingress
+helm upgrade --reuse-values ngx-ingress ingress-nginx/ingress-nginx
 ```

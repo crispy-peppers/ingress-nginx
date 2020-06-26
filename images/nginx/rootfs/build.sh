@@ -14,31 +14,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 set -o errexit
 set -o nounset
 set -o pipefail
 
-export DEBIAN_FRONTEND=noninteractive
-
-export OPENRESTY_VERSION=1.15.8.2
+export NGINX_VERSION=1.19.0
+export NDK_VERSION=0.3.1rc1
+export SETMISC_VERSION=0.32
+export MORE_HEADERS_VERSION=0.33
 export NGINX_DIGEST_AUTH=cd8641886c873cf543255aeda20d23e4cd603d05
 export NGINX_SUBSTITUTIONS=bc58cb11844bc42735bbaef7085ea86ace46d05b
 export NGINX_OPENTRACING_VERSION=0.9.0
 export OPENTRACING_CPP_VERSION=1.5.1
 export ZIPKIN_CPP_VERSION=0.5.2
-export JAEGER_VERSION=cdfaf5bb25ff5f8ec179fd548e6c7c2ade9a6a09
-export MSGPACK_VERSION=3.1.1
-export DATADOG_CPP_VERSION=1.0.1
-export MODSECURITY_VERSION=d7101e13685efd7e7c9f808871b202656a969f4b
-export MODSECURITY_LIB_VERSION=3.0.3
-export OWASP_MODSECURITY_CRS_VERSION=3.1.0
+export JAEGER_VERSION=0.4.2
+export MSGPACK_VERSION=3.2.1
+export DATADOG_CPP_VERSION=1.1.5
+export MODSECURITY_VERSION=1.0.1
+export MODSECURITY_LIB_VERSION=v3.0.4
+export OWASP_MODSECURITY_CRS_VERSION=v3.2.0
+export LUA_NGX_VERSION=0.10.15
+export LUA_STREAM_NGX_VERSION=0.0.7
+export LUA_UPSTREAM_VERSION=0.07
 export LUA_BRIDGE_TRACER_VERSION=0.1.1
+export LUA_CJSON_VERSION=2.1.0.7
 export NGINX_INFLUXDB_VERSION=5b09391cb7b9a889687c0aa67964c06a2d933e8b
-export GEOIP2_VERSION=3.2
+export GEOIP2_VERSION=3.3
 export NGINX_AJP_VERSION=bf6cd93f2098b59260de8d494f0f4b1f11a84627
-export RESTY_LUAROCKS_VERSION=3.1.3
-export LUA_RESTY_BALANCER_VERSION=0.03
+
+export LUAJIT_VERSION=31116c4d25c4283a52b2d87fed50101cf20f5b77
+
+export LUA_RESTY_BALANCER=0.03
+export LUA_RESTY_CACHE=0.10rc1
+export LUA_RESTY_CORE=0.1.17
+export LUA_RESTY_COOKIE_VERSION=766ad8c15e498850ac77f5e0265f1d3f30dc4027
+export LUA_RESTY_DNS=0.21
+export LUA_RESTY_HTTP=0.15
+export LUA_RESTY_LOCK=0.08
 
 export BUILD_PATH=/tmp/build
 
@@ -58,74 +70,64 @@ get_src()
   rm -rf "$f"
 }
 
-apt-get update && apt-get dist-upgrade -y
+apk update
+apk upgrade
 
 # install required packages to build
-clean-install \
+apk add \
   bash \
-  build-essential \
+  gcc \
+  clang \
+  libc-dev \
+  make \
+  automake \
+  openssl-dev \
+  pcre-dev \
+  zlib-dev \
+  linux-headers \
+  libxslt-dev \
+  gd-dev \
+  geoip-dev \
+  perl-dev \
+  libedit-dev \
+  mercurial \
+  alpine-sdk \
+  findutils \
   curl ca-certificates \
-  libgeoip1 \
-  libgeoip-dev \
   patch \
-  libpcre3 \
-  libpcre3-dev \
-  libssl-dev \
-  zlib1g \
-  zlib1g-dev \
-  libaio1 \
   libaio-dev \
   openssl \
-  libperl-dev \
   cmake \
   util-linux \
-  lmdb-utils \
+  lmdb-tools \
   wget \
-  libcurl4-openssl-dev \
-  libprotobuf-dev protobuf-compiler \
-  libz-dev \
-  procps \
-  git g++ pkgconf flex bison doxygen libyajl-dev liblmdb-dev libtool dh-autoreconf libxml2 libpcre++-dev libxml2-dev \
-  python \
+  curl-dev \
+  libprotobuf \
+  git g++ pkgconf flex bison doxygen yajl-dev lmdb-dev libtool autoconf libxml2 libxml2-dev \
+  python3 \
   libmaxminddb-dev \
-  dumb-init \
   bc \
   unzip \
-  nano \
-  ssdeep \
-  || exit 1
-
-# https://www.mail-archive.com/debian-bugs-dist@lists.debian.org/msg1667178.html
-if [[ ${ARCH} == "armv7l" ]]; then
-  echo "Fixing ca-certificates"
-  touch /etc/ssl/certs/ca-certificates.crt
-  c_rehash
-fi
+  dos2unix \
+  yaml-cpp
 
 mkdir -p /etc/nginx
-
-# Get the GeoIP data
-GEOIP_FOLDER=/etc/nginx/geoip
-mkdir -p $GEOIP_FOLDER
-
-function geoip2_get {
-  wget -O $GEOIP_FOLDER/$1.tar.gz $2 || { echo "Could not download $1, exiting." ; exit 1; }
-  mkdir $GEOIP_FOLDER/$1 \
-    && tar xf $GEOIP_FOLDER/$1.tar.gz -C $GEOIP_FOLDER/$1 --strip-components 1 \
-    && mv $GEOIP_FOLDER/$1/$1.mmdb $GEOIP_FOLDER/$1.mmdb \
-    && rm -rf $GEOIP_FOLDER/$1 \
-    && rm -rf $GEOIP_FOLDER/$1.tar.gz
-}
-
-geoip2_get "GeoLite2-City"     "http://geolite.maxmind.com/download/geoip/database/GeoLite2-City.tar.gz"
-geoip2_get "GeoLite2-ASN"      "http://geolite.maxmind.com/download/geoip/database/GeoLite2-ASN.tar.gz"
 
 mkdir --verbose -p "$BUILD_PATH"
 cd "$BUILD_PATH"
 
 # download, verify and extract the source files
-get_src bf92af41d3ad22880047a8b283fc213d59c7c1b83f8dae82e50d14b64d73ac38 \
-        "https://github.com/openresty/openresty/releases/download/v${OPENRESTY_VERSION}/openresty-${OPENRESTY_VERSION}.tar.gz"
+get_src 44a616171fcd7d7ad7c6af3e6f3ad0879b54db5a5d21be874cd458b5691e36c8 \
+        "https://nginx.org/download/nginx-$NGINX_VERSION.tar.gz"
+
+get_src 49f50d4cd62b166bc1aaf712febec5e028d9f187cedbc27a610dfd01bdde2d36 \
+        "https://github.com/simpl/ngx_devel_kit/archive/v$NDK_VERSION.tar.gz"
+
+get_src f1ad2459c4ee6a61771aa84f77871f4bfe42943a4aa4c30c62ba3f981f52c201 \
+        "https://github.com/openresty/set-misc-nginx-module/archive/v$SETMISC_VERSION.tar.gz"
+
+get_src a3dcbab117a9c103bc1ea5200fc00a7b7d2af97ff7fd525f16f8ac2632e30fbf \
+        "https://github.com/openresty/headers-more-nginx-module/archive/v$MORE_HEADERS_VERSION.tar.gz"
 
 get_src fe683831f832aae4737de1e1026a4454017c2d5f98cb88b08c5411dc380062f8 \
         "https://github.com/atomx/nginx-http-auth-digest/archive/$NGINX_DIGEST_AUTH.tar.gz"
@@ -142,16 +144,28 @@ get_src 015c4187f7a6426a2b5196f0ccd982aa87f010cf61f507ae3ce5c90523f92301 \
 get_src 30affaf0f3a84193f7127cc0135da91773ce45d902414082273dae78914f73df \
         "https://github.com/rnburn/zipkin-cpp-opentracing/archive/v$ZIPKIN_CPP_VERSION.tar.gz"
 
-get_src 5c8d25e68fb852f61489b669aebb7bd8ca8c88ebb5e5f969212fcceff3ee2d0b \
-        "https://github.com/SpiderLabs/ModSecurity-nginx/archive/$MODSECURITY_VERSION.tar.gz"
+get_src c969a78659bb47c84929de0b9adc1f8c512a51ec9dd3b162cb568ae228d3d59e \
+        "https://github.com/SpiderLabs/ModSecurity-nginx/archive/v$MODSECURITY_VERSION.tar.gz"
 
-get_src 3183450d897baa9309347c8617edc0c97c5b29ffc32bd2d12f498edf2dcbeffa \
-        "https://github.com/jaegertracing/jaeger-client-cpp/archive/$JAEGER_VERSION.tar.gz"
+get_src 21257af93a64fee42c04ca6262d292b2e4e0b7b0660c511db357b32fd42ef5d3 \
+        "https://github.com/jaegertracing/jaeger-client-cpp/archive/v$JAEGER_VERSION.tar.gz"
 
-get_src bda49f996a73d2c6080ff0523e7b535917cd28c8a79c3a5da54fc29332d61d1e \
+get_src 464f46744a6be778626d11452c4db3c2d09461080c6db42e358e21af19d542f6 \
         "https://github.com/msgpack/msgpack-c/archive/cpp-$MSGPACK_VERSION.tar.gz"
 
-get_src f7fb2ad541f812c36fd78f9a38e4582d87dadb563ab80bee3f7c3a2132a425c5 \
+get_src 7d5f3439c8df56046d0564b5857fd8a30296ab1bd6df0f048aed7afb56a0a4c2 \
+        "https://github.com/openresty/lua-nginx-module/archive/v$LUA_NGX_VERSION.tar.gz"
+
+get_src 99c47c75c159795c9faf76bbb9fa58e5a50b75286c86565ffcec8514b1c74bf9 \
+        "https://github.com/openresty/stream-lua-nginx-module/archive/v$LUA_STREAM_NGX_VERSION.tar.gz"
+
+get_src 2a69815e4ae01aa8b170941a8e1a10b6f6a9aab699dee485d58f021dd933829a \
+        "https://github.com/openresty/lua-upstream-nginx-module/archive/v$LUA_UPSTREAM_VERSION.tar.gz"
+
+get_src 82bf1af1ee89887648b53c9df566f8b52ec10400f1641c051970a7540b7bf06a \
+        "https://github.com/openresty/luajit2/archive/$LUAJIT_VERSION.tar.gz"
+
+get_src b84fd2fb0bb0578af4901db31d1c0ae909b532a1016fe6534cbe31a6c3ad6924 \
         "https://github.com/DataDog/dd-opentracing-cpp/archive/v$DATADOG_CPP_VERSION.tar.gz"
 
 get_src 6faab57557bd9cc9fc38208f6bc304c1c13cf048640779f98812cf1f9567e202 \
@@ -160,17 +174,42 @@ get_src 6faab57557bd9cc9fc38208f6bc304c1c13cf048640779f98812cf1f9567e202 \
 get_src 1af5a5632dc8b00ae103d51b7bf225de3a7f0df82f5c6a401996c080106e600e \
         "https://github.com/influxdata/nginx-influxdb-module/archive/$NGINX_INFLUXDB_VERSION.tar.gz"
 
-get_src 15bd1005228cf2c869a6f09e8c41a6aaa6846e4936c473106786ae8ac860fab7 \
+get_src 41378438c833e313a18869d0c4a72704b4835c30acaf7fd68013ab6732ff78a7 \
         "https://github.com/leev/ngx_http_geoip2_module/archive/$GEOIP2_VERSION.tar.gz"
 
 get_src 5f629a50ba22347c441421091da70fdc2ac14586619934534e5a0f8a1390a950 \
         "https://github.com/yaoweibin/nginx_ajp_module/archive/$NGINX_AJP_VERSION.tar.gz"
 
-get_src c573435f495aac159e34eaa0a3847172a2298eb6295fcdc35d565f9f9b990513 \
-        "https://luarocks.github.io/luarocks/releases/luarocks-${RESTY_LUAROCKS_VERSION}.tar.gz"
+get_src 5d16e623d17d4f42cc64ea9cfb69ca960d313e12f5d828f785dd227cc483fcbd \
+        "https://github.com/openresty/lua-resty-upload/archive/v0.10.tar.gz"
+
+get_src 095615fe94e64615c4a27f4f4475b91c047cf8d10bc2dbde8d5ba6aa625fc5ab \
+        "https://github.com/openresty/lua-resty-string/archive/v0.11.tar.gz"
 
 get_src 82209d5a5d9545c6dde3db7857f84345db22162fdea9743d5e2b2094d8d407f8 \
-        "https://github.com/openresty/lua-resty-balancer/archive/v${LUA_RESTY_BALANCER_VERSION}.tar.gz"
+        "https://github.com/openresty/lua-resty-balancer/archive/v$LUA_RESTY_BALANCER.tar.gz"
+
+get_src 8f5f76d2689a3f6b0782f0a009c56a65e4c7a4382be86422c9b3549fe95b0dc4 \
+        "https://github.com/openresty/lua-resty-core/archive/v$LUA_RESTY_CORE.tar.gz"
+
+get_src 59d2f18ecadba48be61061004c8664eaed1111a3372cd2567cb24c5a47eb41fe \
+        "https://github.com/openresty/lua-cjson/archive/$LUA_CJSON_VERSION.tar.gz"
+
+get_src f818b5cef0881e5987606f2acda0e491531a0cb0c126d8dca02e2343edf641ef \
+        "https://github.com/cloudflare/lua-resty-cookie/archive/$LUA_RESTY_COOKIE_VERSION.tar.gz"
+
+get_src f6b57d83a937899f97a98372c1e2631dd1ab8f580fc0ffeac0b27b4d42225a99 \
+        "https://github.com/openresty/lua-resty-lrucache/archive/v$LUA_RESTY_CACHE.tar.gz"
+
+get_src 2b4683f9abe73e18ca00345c65010c9056777970907a311d6e1699f753141de2 \
+        "https://github.com/openresty/lua-resty-lock/archive/v$LUA_RESTY_LOCK.tar.gz"
+
+get_src 4aca34f324d543754968359672dcf5f856234574ee4da360ce02c778d244572a \
+        "https://github.com/openresty/lua-resty-dns/archive/v$LUA_RESTY_DNS.tar.gz"
+
+get_src 987d5754a366d3ccbf745d2765f82595dcff5b94ba6c755eeb6d310447996f32 \
+        "https://github.com/ledgetech/lua-resty-http/archive/v$LUA_RESTY_HTTP.tar.gz"
+
 
 # improve compilation times
 CORES=$(($(grep -c ^processor /proc/cpuinfo) - 0))
@@ -178,24 +217,23 @@ CORES=$(($(grep -c ^processor /proc/cpuinfo) - 0))
 export MAKEFLAGS=-j${CORES}
 export CTEST_BUILD_FLAGS=${MAKEFLAGS}
 export HUNTER_JOBS_NUMBER=${CORES}
-export HUNTER_KEEP_PACKAGE_SOURCES=false
 export HUNTER_USE_CACHE_SERVERS=true
 
-if [[ ${ARCH} == "armv7l" ]]; then
-  export PCRE_DIR=/usr/lib/arm-linux-gnueabihf
-fi
+# Install luajit from openresty fork
+export LUAJIT_LIB=/usr/local/lib
+export LUA_LIB_DIR="$LUAJIT_LIB/lua"
+export LUAJIT_INC=/usr/local/include/luajit-2.1
 
-if [[ ${ARCH} == "x86_64" ]]; then
-  export PCRE_DIR=/usr/lib/x86_64-linux-gnu
-fi
+cd "$BUILD_PATH/luajit2-$LUAJIT_VERSION"
+make CCDEBUG=-g
+make install
 
-if [[ ${ARCH} == "aarch64" ]]; then
-  export PCRE_DIR=/usr/lib/aarch64-linux-gnu
-fi
+ln -s /usr/local/bin/luajit /usr/local/bin/lua
 
 cd "$BUILD_PATH"
 
-export PATH=$PATH:/usr/local/openresty/luajit
+# Git tuning
+git config --global --add core.compression -1
 
 # install openresty-gdb-utils
 cd /
@@ -314,14 +352,30 @@ cd ngx_brotli
 git submodule init
 git submodule update
 
+cd "$BUILD_PATH"
+git clone --depth=1 https://github.com/ssdeep-project/ssdeep
+cd ssdeep/
+
+./bootstrap
+./configure
+
+make
+make install
+
 # build modsecurity library
 cd "$BUILD_PATH"
-git clone -b v$MODSECURITY_LIB_VERSION https://github.com/SpiderLabs/ModSecurity
+git clone --depth=1 -b $MODSECURITY_LIB_VERSION https://github.com/SpiderLabs/ModSecurity
 cd ModSecurity/
 git submodule init
 git submodule update
+
 sh build.sh
-./configure --disable-doxygen-doc --disable-examples --disable-dependency-tracking
+
+./configure \
+  --disable-doxygen-doc \
+  --disable-doxygen-html \
+  --disable-examples
+
 make
 make install
 
@@ -338,7 +392,7 @@ echo "SecAuditLogStorageDir /var/log/audit/" >> /etc/nginx/modsecurity/modsecuri
 # Download owasp modsecurity crs
 cd /etc/nginx/
 
-git clone -b v$OWASP_MODSECURITY_CRS_VERSION https://github.com/SpiderLabs/owasp-modsecurity-crs
+git clone -b $OWASP_MODSECURITY_CRS_VERSION https://github.com/SpiderLabs/owasp-modsecurity-crs
 cd owasp-modsecurity-crs
 
 mv crs-setup.conf.example crs-setup.conf
@@ -379,7 +433,13 @@ Include /etc/nginx/owasp-modsecurity-crs/rules/RESPONSE-999-EXCLUSION-RULES-AFTE
 " > /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
 
 # build nginx
-cd "$BUILD_PATH/openresty-$OPENRESTY_VERSION"
+cd "$BUILD_PATH/nginx-$NGINX_VERSION"
+
+# apply nginx patches
+for PATCH in `ls /patches`;do
+  echo "Patch: $PATCH"
+  patch -p1 < /patches/$PATCH
+done
 
 WITH_FLAGS="--with-debug \
   --with-compat \
@@ -396,13 +456,11 @@ WITH_FLAGS="--with-debug \
   --with-http_v2_module \
   --with-stream \
   --with-stream_ssl_module \
+  --with-stream_realip_module \
   --with-stream_ssl_preread_module \
   --with-threads \
   --with-http_secure_link_module \
-  --with-http_gunzip_module \
-  --with-md5-asm \
-  --with-sha1-asm \
-  -j${CORES} "
+  --with-http_gunzip_module"
 
 # "Combining -flto with -g is currently experimental and expected to produce unexpected results."
 # https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
@@ -432,8 +490,14 @@ if [[ ${ARCH} == "x86_64" ]]; then
   CC_OPT+=' -m64 -mtune=native'
 fi
 
-WITH_MODULES="--add-module=$BUILD_PATH/nginx-http-auth-digest-$NGINX_DIGEST_AUTH \
+WITH_MODULES="--add-module=$BUILD_PATH/ngx_devel_kit-$NDK_VERSION \
+  --add-module=$BUILD_PATH/set-misc-nginx-module-$SETMISC_VERSION \
+  --add-module=$BUILD_PATH/headers-more-nginx-module-$MORE_HEADERS_VERSION \
+  --add-module=$BUILD_PATH/nginx-http-auth-digest-$NGINX_DIGEST_AUTH \
   --add-module=$BUILD_PATH/ngx_http_substitutions_filter_module-$NGINX_SUBSTITUTIONS \
+  --add-module=$BUILD_PATH/lua-nginx-module-$LUA_NGX_VERSION \
+  --add-module=$BUILD_PATH/stream-lua-nginx-module-$LUA_STREAM_NGX_VERSION \
+  --add-module=$BUILD_PATH/lua-upstream-nginx-module-$LUA_UPSTREAM_VERSION \
   --add-module=$BUILD_PATH/nginx-influxdb-module-$NGINX_INFLUXDB_VERSION \
   --add-dynamic-module=$BUILD_PATH/nginx-opentracing-$NGINX_OPENTRACING_VERSION/opentracing \
   --add-dynamic-module=$BUILD_PATH/ModSecurity-nginx-$MODSECURITY_VERSION \
@@ -442,6 +506,18 @@ WITH_MODULES="--add-module=$BUILD_PATH/nginx-http-auth-digest-$NGINX_DIGEST_AUTH
   --add-module=$BUILD_PATH/ngx_brotli"
 
 ./configure \
+  --prefix=/usr/local/nginx \
+  --conf-path=/etc/nginx/nginx.conf \
+  --modules-path=/etc/nginx/modules \
+  --http-log-path=/var/log/nginx/access.log \
+  --error-log-path=/var/log/nginx/error.log \
+  --lock-path=/var/lock/nginx.lock \
+  --pid-path=/run/nginx.pid \
+  --http-client-body-temp-path=/var/lib/nginx/body \
+  --http-fastcgi-temp-path=/var/lib/nginx/fastcgi \
+  --http-proxy-temp-path=/var/lib/nginx/proxy \
+  --http-scgi-temp-path=/var/lib/nginx/scgi \
+  --http-uwsgi-temp-path=/var/lib/nginx/uwsgi \
   ${WITH_FLAGS} \
   --without-mail_pop3_module \
   --without-mail_smtp_module \
@@ -454,44 +530,45 @@ WITH_MODULES="--add-module=$BUILD_PATH/nginx-http-auth-digest-$NGINX_DIGEST_AUTH
   --group=www-data \
   ${WITH_MODULES}
 
-make || exit 1
-make install || exit 1
-
-cd "$BUILD_PATH/luarocks-${RESTY_LUAROCKS_VERSION}"
-./configure \
-  --prefix=/usr/local/openresty/luajit \
-  --with-lua=/usr/local/openresty/luajit \
-  --lua-suffix=jit-2.1.0-beta3 \
-  --with-lua-include=/usr/local/openresty/luajit/include/luajit-2.1
-
-make || exit 1
-make install || exit 1
-
-export PATH=$PATH:/usr/local/openresty/luajit/bin
-
-cd /usr/local/openresty
-
-# build and install lua-resty-waf with dependencies
-export LUA_LIB_DIR=/usr/local/openresty/lualib
-export LUA_INCLUDE_DIR=/tmp/build/openresty-$OPENRESTY_VERSION/build/luajit-root/usr/local/openresty/luajit/include/luajit-2.1
-
-ln -s $LUA_INCLUDE_DIR /usr/include/lua5.1
-
-if [[ ${ARCH} != "armv7l" ]]; then
-  luarocks install lrexlib-pcre 2.7.2-1 PCRE_LIBDIR=${PCRE_DIR}
-fi
-
-luarocks install lua-resty-iputils 0.3.0-1
-luarocks install lua-resty-cookie 0.1.0-1
-
-cd "$BUILD_PATH/lua-resty-balancer-$LUA_RESTY_BALANCER_VERSION"
-
 make
 make install
 
-if [[ ${ARCH} != "armv7l" ]]; then
-  /install_lua_resty_waf.sh
-fi
+cd "$BUILD_PATH/lua-resty-core-$LUA_RESTY_CORE"
+make install
+
+cd "$BUILD_PATH/lua-resty-balancer-$LUA_RESTY_BALANCER"
+make all
+make install
+
+export LUA_INCLUDE_DIR=/usr/local/include/luajit-2.1
+ln -s $LUA_INCLUDE_DIR /usr/include/lua5.1
+
+cd "$BUILD_PATH/lua-cjson-$LUA_CJSON_VERSION"
+make all
+make install
+
+cd "$BUILD_PATH/lua-resty-cookie-$LUA_RESTY_COOKIE_VERSION"
+make all
+make install
+
+cd "$BUILD_PATH/lua-resty-lrucache-$LUA_RESTY_CACHE"
+make install
+
+cd "$BUILD_PATH/lua-resty-dns-$LUA_RESTY_DNS"
+make install
+
+cd "$BUILD_PATH/lua-resty-lock-$LUA_RESTY_LOCK"
+make install
+
+# required for OCSP verification
+cd "$BUILD_PATH/lua-resty-http-$LUA_RESTY_HTTP"
+make install
+
+cd "$BUILD_PATH/lua-resty-upload-0.10"
+make install
+
+cd "$BUILD_PATH/lua-resty-string-0.11"
+make install
 
 # build Lua bridge tracer
 cd "$BUILD_PATH/lua-bridge-tracer-$LUA_BRIDGE_TRACER_VERSION"
@@ -503,83 +580,34 @@ make install
 
 # mimalloc
 cd "$BUILD_PATH"
-git clone https://github.com/microsoft/mimalloc
+git clone --depth=1 -b v1.6.3 https://github.com/microsoft/mimalloc
 cd mimalloc
+
 mkdir -p out/release
 cd out/release
 cmake ../..
 make
 make install
 
-echo "Cleaning..."
-
-cd /
-
-apt-mark unmarkauto \
-  bash \
-  curl ca-certificates \
-  libgeoip1 \
-  libpcre3 \
-  zlib1g \
-  libaio1 \
-  geoip-bin \
-  libyajl2 liblmdb0 libxml2 libpcre++ \
-  gzip \
-  openssl
-
-apt-get remove -y --purge \
-  build-essential \
-  libgeoip-dev \
-  libpcre3-dev \
-  libssl-dev \
-  zlib1g-dev \
-  libaio-dev \
-  linux-libc-dev \
-  cmake \
-  wget \
-  patch \
-  protobuf-compiler \
-  python \
-  xz-utils \
-  bc \
-  sensible-utils \
-  git g++ pkgconf flex bison doxygen libyajl-dev liblmdb-dev libgeoip-dev libtool dh-autoreconf libpcre++-dev libxml2-dev
-
-apt-get autoremove -y
-
-# Remove configuration files left after the package removal.
-# To see such packages run: apt list | grep residual
-dpkg -l | grep '^rc' | awk '{print $2}' | xargs apt-get purge --yes
-
-rm -rf "$BUILD_PATH"
-rm -Rf /usr/share/man /usr/share/doc
-rm -rf /tmp/* /var/tmp/*
-rm -rf /var/lib/apt/lists/*
-rm -rf /var/cache/apt/archives/*
-rm -rf /usr/local/modsecurity/bin
-rm -rf /usr/local/modsecurity/include
-rm -rf /usr/local/modsecurity/lib/libmodsecurity.a
-
-rm -rf /root/.cache
-
-rm -rf /etc/nginx/owasp-modsecurity-crs/.git
-rm -rf /etc/nginx/owasp-modsecurity-crs/util/regression-tests
-
-rm -rf $HOME/.hunter
-
-rm -rf $LUA_INCLUDE_DIR /usr/include/lua5.1
-
 # update image permissions
 writeDirs=( \
   /etc/nginx \
-  /usr/local/openresty/nginx \
+  /usr/local/nginx \
   /opt/modsecurity/var/log \
   /opt/modsecurity/var/upload \
   /opt/modsecurity/var/audit \
   /var/log/audit \
+  /var/log/nginx \
 );
+
+addgroup -Sg 101 www-data
+adduser -S -D -H -u 101 -h /usr/local/nginx -s /sbin/nologin -G www-data -g www-data www-data
 
 for dir in "${writeDirs[@]}"; do
   mkdir -p ${dir};
   chown -R www-data.www-data ${dir};
 done
+
+rm -rf /etc/nginx/owasp-modsecurity-crs/.git
+rm -rf /etc/nginx/owasp-modsecurity-crs/util/regression-tests
+rm -rf /usr/local/modsecurity/lib/libmodsecurity.a

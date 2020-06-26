@@ -46,7 +46,7 @@ import (
 	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/klog"
 
-	adm_controler "k8s.io/ingress-nginx/internal/admission/controller"
+	adm_controller "k8s.io/ingress-nginx/internal/admission/controller"
 	"k8s.io/ingress-nginx/internal/file"
 	"k8s.io/ingress-nginx/internal/ingress"
 	"k8s.io/ingress-nginx/internal/ingress/annotations/class"
@@ -113,7 +113,7 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 	if n.cfg.ValidationWebhook != "" {
 		n.validationWebhookServer = &http.Server{
 			Addr:      config.ValidationWebhook,
-			Handler:   adm_controler.NewAdmissionControllerServer(&adm_controler.IngressAdmission{Checker: n}),
+			Handler:   adm_controller.NewAdmissionControllerServer(&adm_controller.IngressAdmission{Checker: n}),
 			TLSConfig: ssl.NewTLSListener(n.cfg.ValidationWebhookCertPath, n.cfg.ValidationWebhookKeyPath).TLSConfig(),
 		}
 	}
@@ -334,30 +334,20 @@ func (n *NGINXController) Start() {
 		select {
 		case err := <-n.ngxErrCh:
 			if n.isShuttingDown {
-				break
+				return
 			}
 
-			// if the nginx master process dies the workers continue to process requests,
-			// passing checks but in case of updates in ingress no updates will be
-			// reflected in the nginx configuration which can lead to confusion and report
-			// issues because of this behavior.
-			// To avoid this issue we restart nginx in case of errors.
+			// if the nginx master process dies, the workers continue to process requests
+			// until the failure of the configured livenessProbe and restart of the pod.
 			if process.IsRespawnIfRequired(err) {
-				process.WaitUntilPortIsAvailable(n.cfg.ListenPorts.HTTP)
-				// release command resources
-				cmd.Process.Release()
-				// start a new nginx master process if the controller is not being stopped
-				cmd = n.command.ExecCommand()
-				cmd.SysProcAttr = &syscall.SysProcAttr{
-					Setpgid: true,
-					Pgid:    0,
-				}
-				n.start(cmd)
+				return
 			}
+
 		case event := <-n.updateCh.Out():
 			if n.isShuttingDown {
 				break
 			}
+
 			if evt, ok := event.(store.Event); ok {
 				klog.V(3).Infof("Event %v received - object %v", evt.Type, evt.Obj)
 				if evt.Type == store.ConfigurationEvent {
@@ -371,7 +361,7 @@ func (n *NGINXController) Start() {
 				klog.Warningf("Unexpected event type received %T", event)
 			}
 		case <-n.stopCh:
-			break
+			return
 		}
 	}
 }
@@ -498,14 +488,25 @@ func (n NGINXController) generateTemplate(cfg ngx_config.Configuration, ingressC
 	var serverNameBytes int
 
 	for _, srv := range ingressCfg.Servers {
-		if longestName < len(srv.Hostname) {
-			longestName = len(srv.Hostname)
+		hostnameLength := len(srv.Hostname)
+		if srv.RedirectFromToWWW {
+			hostnameLength += 4
 		}
-		serverNameBytes += len(srv.Hostname)
+		if longestName < hostnameLength {
+			longestName = hostnameLength
+		}
+
+		for _, alias := range srv.Aliases {
+			if longestName < len(alias) {
+				longestName = len(alias)
+			}
+		}
+
+		serverNameBytes += hostnameLength
 	}
 
-	if cfg.ServerNameHashBucketSize == 0 {
-		nameHashBucketSize := nginxHashBucketSize(longestName)
+	nameHashBucketSize := nginxHashBucketSize(longestName)
+	if cfg.ServerNameHashBucketSize < nameHashBucketSize {
 		klog.V(3).Infof("Adjusting ServerNameHashBucketSize variable to %d", nameHashBucketSize)
 		cfg.ServerNameHashBucketSize = nameHashBucketSize
 	}
@@ -603,12 +604,13 @@ func (n NGINXController) generateTemplate(cfg ngx_config.Configuration, ingressC
 		ListenPorts:              n.cfg.ListenPorts,
 		PublishService:           n.GetPublishService(),
 		EnableMetrics:            n.cfg.EnableMetrics,
-
-		HealthzURI: nginx.HealthPath,
-		PID:        nginx.PID,
-		StatusPath: nginx.StatusPath,
-		StatusPort: nginx.StatusPort,
-		StreamPort: nginx.StreamPort,
+		MaxmindEditionFiles:      n.cfg.MaxmindEditionFiles,
+		HealthzURI:               nginx.HealthPath,
+		MonitorMaxBatchSize:      n.cfg.MonitorMaxBatchSize,
+		PID:                      nginx.PID,
+		StatusPath:               nginx.StatusPath,
+		StatusPort:               nginx.StatusPort,
+		StreamPort:               nginx.StreamPort,
 	}
 
 	tc.Cfg.Checksum = ingressCfg.ConfigurationChecksum
@@ -661,11 +663,9 @@ func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
 		return err
 	}
 
-	if cfg.EnableOpentracing {
-		err := createOpentracingCfg(cfg)
-		if err != nil {
-			return err
-		}
+	err = createOpentracingCfg(cfg)
+	if err != nil {
+		return err
 	}
 
 	err = n.testTemplate(content)
@@ -686,7 +686,7 @@ func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
 				return err
 			}
 
-			diffOutput, err := exec.Command("diff", "-u", cfgPath, tmpfile.Name()).CombinedOutput()
+			diffOutput, err := exec.Command("diff", "-I", "'# Configuration.*'", "-u", cfgPath, tmpfile.Name()).CombinedOutput()
 			if err != nil {
 				if exitError, ok := err.(*exec.ExitError); ok {
 					ws := exitError.Sys().(syscall.WaitStatus)
@@ -1075,7 +1075,9 @@ const datadogTmpl = `{
   "service": "{{ .DatadogServiceName }}",
   "agent_host": "{{ .DatadogCollectorHost }}",
   "agent_port": {{ .DatadogCollectorPort }},
-  "operation_name_override": "{{ .DatadogOperationNameOverride }}"
+  "operation_name_override": "{{ .DatadogOperationNameOverride }}",
+  "sample_rate": {{ .DatadogSampleRate }},
+  "dd.priority.sampling": {{ .DatadogPrioritySampling }}
 }`
 
 func createOpentracingCfg(cfg ngx_config.Configuration) error {
