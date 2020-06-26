@@ -1,7 +1,7 @@
 apiVersion: v1
 data:
   use-proxy-protocol: "true"
-  X-Original-Uri: "true"
+  proxy-add-original-uri-header: "true"
 kind: ConfigMap
 metadata:
   annotations:
